@@ -1,106 +1,134 @@
 from fastapi import FastAPI
+import yfinance as yf
+import pandas as pd
 import requests
+import time
 
-TRADIENT_API_KEY = "PASTE_YOUR_TRADIENT_API_KEY"
+app = FastAPI(title="StockTrend AI API")
 
-app = FastAPI()
+# ---------------------------
+# NSE SYMBOL AUTO-FETCH
+# ---------------------------
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+    "Referer": "https://www.nseindia.com"
+}
 
-# -----------------------------
-# LOAD NSE SYMBOLS (FREE)
-# -----------------------------
-def load_nse_symbols():
-    url = "https://raw.githubusercontent.com/sharanchetan/nse-stock-symbols/master/data/symbols.csv"
-    symbols = set()
-
+def fetch_nse_symbols():
     try:
-        csv_data = requests.get(url, timeout=10).text.splitlines()
-        for row in csv_data[1:]:
-            symbol = row.split(",")[0].strip().upper()
-            symbols.add(symbol)
+        s = requests.Session()
+        s.headers.update(NSE_HEADERS)
+        url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
+        data = s.get(url, timeout=10).json()
+        return {item["symbol"] for item in data["data"]}
     except:
-        pass
+        return set()
 
-    # Add indices manually
-    indices = {
-        "NIFTY", "BANKNIFTY", "FINNIFTY",
-        "SENSEX", "MIDCPNIFTY"
-    }
+# Cache symbols (refresh every 6 hours)
+LAST_FETCH = 0
+NSE_SYMBOLS = set()
 
-    return symbols.union(indices)
+def get_symbols():
+    global LAST_FETCH, NSE_SYMBOLS
+    if time.time() - LAST_FETCH > 21600 or not NSE_SYMBOLS:
+        NSE_SYMBOLS = fetch_nse_symbols()
+        NSE_SYMBOLS.update({
+            "NIFTY", "BANKNIFTY", "FINNIFTY",
+            "SENSEX", "MIDCPNIFTY"
+        })
+        LAST_FETCH = time.time()
+    return NSE_SYMBOLS
 
-ALLOWED_SYMBOLS = load_nse_symbols()
+# ---------------------------
+# TECHNICAL INDICATORS
+# ---------------------------
+def add_indicators(df):
+    df["EMA20"] = df["Close"].ewm(span=20).mean()
+    df["EMA50"] = df["Close"].ewm(span=50).mean()
 
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    exp1 = df["Close"].ewm(span=12).mean()
+    exp2 = df["Close"].ewm(span=26).mean()
+    df["MACD"] = exp1 - exp2
+    df["SIGNAL"] = df["MACD"].ewm(span=9).mean()
+
+    df["VOL_MA"] = df["Volume"].rolling(20).mean()
+    return df
+
+# ---------------------------
+# AI-LIKE SCORING ENGINE
+# ---------------------------
+def ai_score(latest):
+    score = 0
+
+    if latest["RSI"] < 30:
+        score += 2
+    elif latest["RSI"] > 70:
+        score -= 2
+
+    score += 1 if latest["EMA20"] > latest["EMA50"] else -1
+    score += 1 if latest["MACD"] > latest["SIGNAL"] else -1
+    score += 1 if latest["Volume"] > latest["VOL_MA"] else 0
+
+    return score
+
+# ---------------------------
+# API ROUTES
+# ---------------------------
 @app.get("/")
 def home():
     return {
-        "status": "StockTrend API Live",
-        "symbols_loaded": len(ALLOWED_SYMBOLS)
+        "status": "StockTrend AI running",
+        "data_type": "Technical probability (not financial advice)"
     }
 
-# -----------------------------
-# TECHNICAL ANALYSIS
-# -----------------------------
-def analyze(data):
-    rsi = data.get("rsi", 50)
-    ema9 = data.get("ema_9", 0)
-    ema21 = data.get("ema_21", 0)
-    macd = data.get("macd", "neutral")
-
-    direction = "SIDEWAYS"
-    signal = "WAIT"
-    confidence = 55
-
-    if rsi > 55 and ema9 > ema21 and macd == "bullish":
-        direction = "UP"
-        signal = "BUY"
-        confidence = round(min(85, rsi + 15), 2)
-
-    elif rsi < 45 and ema9 < ema21 and macd == "bearish":
-        direction = "DOWN"
-        signal = "SELL"
-        confidence = round(min(85, (100 - rsi) + 15), 2)
-
-    return direction, signal, confidence
-
-# -----------------------------
-# PREDICTION API
-# -----------------------------
 @app.get("/predict/{symbol}")
 def predict(symbol: str):
     symbol = symbol.upper()
+    symbols = get_symbols()
 
-    if symbol not in ALLOWED_SYMBOLS:
-        return {
-            "error": "Invalid NSE symbol",
-            "message": "Symbol not found in NSE database"
-        }
+    if symbol not in symbols:
+        return {"error": "Invalid NSE symbol"}
 
-    url = f"https://api.tradient.org/v1/api/market/technicals?symbol={symbol}&duration=1"
-    headers = {
-        "Authorization": f"Bearer {TRADIENT_API_KEY}",
-        "Accept": "application/json"
-    }
+    yf_symbol = (
+        "^NSEI" if symbol == "NIFTY"
+        else symbol + ".NS"
+    )
 
-    res = requests.get(url, headers=headers).json()
+    df = yf.download(
+        yf_symbol,
+        period="5d",
+        interval="5m",
+        progress=False
+    )
 
-    if "data" not in res:
-        return {"error": "Live market data unavailable"}
+    if df.empty or len(df) < 50:
+        return {"error": "Market data unavailable"}
 
-    tech = res["data"]
-    direction, signal, confidence = analyze(tech)
+    df = add_indicators(df)
+    latest = df.iloc[-1]
+
+    score = ai_score(latest)
+
+    trend = "UP" if score > 0 else "DOWN"
+    confidence = min(95, max(55, abs(score) / 5 * 100))
 
     return {
         "symbol": symbol,
-        "timeframe": "NEXT_1_HOUR",
-        "direction": direction,
-        "signal": signal,
-        "confidence_percent": confidence,
+        "trend_next_hour": trend,
+        "confidence_percent": round(confidence, 2),
         "indicators": {
-            "RSI": tech.get("rsi"),
-            "EMA_9": tech.get("ema_9"),
-            "EMA_21": tech.get("ema_21"),
-            "MACD": tech.get("macd")
+            "rsi": round(latest["RSI"], 2),
+            "ema20": round(latest["EMA20"], 2),
+            "ema50": round(latest["EMA50"], 2),
+            "macd": round(latest["MACD"], 2),
+            "volume_strength": "HIGH" if latest["Volume"] > latest["VOL_MA"] else "NORMAL"
         },
-        "source": "NSE + Tradient",
-        "note": "Educational probability-based prediction"
+        "note": "AI-based probability, not guaranteed outcome"
     }
