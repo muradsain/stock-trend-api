@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: stock-trend-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn trend_api:app --host 0.0.0.0 --port 10000
